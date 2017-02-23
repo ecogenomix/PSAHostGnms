@@ -1,0 +1,460 @@
+---
+title: "Code and figures to complement 'Comparative omics and trait analyses of particle-associated <i>Pseudoalteromonas</i> phages advance the phage OTU concept'"
+author: "Melissa B. Duhaime"
+date: "February 15, 2017"
+output:  html_document
+---
+<!--BEGIN:  Set the global options and load packages-->
+# Setting up environment
+
+```{r set-global-options, echo = TRUE}
+knitr::opts_chunk$set(eval = TRUE, 
+                      echo = TRUE, 
+                      cache = FALSE,
+                      include = TRUE,
+                      collapse = FALSE,
+                      dependson = NULL,
+                      engine = "R", # Chunks will always have R code, unless noted
+                      message = FALSE,
+                      #dev = 'pdf',
+                      fig.path="Figures/",  # Set the figure options
+                      fig.align = "center"
+                      
+                      #, 
+                      # fig.width = 6,
+                      # fig.height = 6
+                      )
+```
+
+Load needed packages. Note, I set the working directory here and you can do the same to point it to the contents of git hub zipped folder. I still hardcoded the full path to files as I call them through this document because I could not get knitr to generate html by calling the set wd...one of those mysteries, maybe you have better luck.
+```{r load}
+library(knitr)
+library(vegan)
+library(ggplot2)
+library(Hmisc)
+library(RColorBrewer)
+library(gplots)
+library(plyr)
+library(dplyr)
+library(reshape2)
+library(DT)
+```
+
+<!--END:  Set the global options and load packages-->
+
+# Figure 1. Genome relatedness heatmap.
+
+## How many genera of PSA phages exist? And who belong to those genera?
+
+I will use the working definition of genera set forth by Lavigne et al, 2008 (http://www.sciencedirect.com/science/article/pii/S0923250808000545), whereby phage genus membership is defined at >40% genes shared at bitscore > 75.
+
+1. To answer this, I collected the protein sequences of all phages of *Pseudoalteromonas*. This list included:
+  * 8 Helgoland PSA phage isolates that we sequenced here
+  * 7 PSA phage isolates sequenced by others (available from GenBank)
+  * 7 prophages predicted from Helgoland PSA bacterial genomes
+  * 28 prophages predicted from published PSA bacterial genomes (available from GenBank and WGS; only those considered "high-quality" prophage predictions by VirSorter)
+
+This resulted in 2378 proteins, available in the file ```cat_all_PSA_phg_names.faa```
+
+2. Next, I ran an all-against-all blastp of these proteins.  
+```
+makeblastdb -in cat_all_PSA_phg_names.faa -dbtype prot
+blastp -db cat_all_PSA_phg_names.faa -query cat_all_PSA_phg_names.faa -outfmt 6 -evalue 0.01 > all_v_all.blastp
+```
+These results (```all_v_all.blastp```) are called into a dataframe. Only hits with bitscore >75 were considered, per [Lavigne et al. 2008](http://www.sciencedirect.com/science/article/pii/S0923250808000545).
+```{r PSA_all_v_all_blastp}
+#setwd("/Users/duhaimem/busibee/PostDoc/TMPL/Helgoland_Phages/ecogenomics_project/genome_analysis/JGI/phage/seq_data/genes.aa")
+
+allPSA<-read.table("/Users/duhaimem/busibee/PostDoc/TMPL/Helgoland_Phages/ecogenomics_project/genome_analysis/JGI/phage/seq_data/genes.aa/all_v_all.blastp", header=FALSE)
+
+colnames(allPSA) <- c("query","sbjt","%id","algnmt_ln","mismtch","gaps","q.start","q.end","s.start","s.end","eval","bit")
+
+allPSA_bs75 <- filter(allPSA, bit > 75)
+
+datatable(allPSA_bs75, 
+          options = list(pageLength = 5),
+          caption = "All-v-All Blastp results"
+          )
+```
+
+Next, the number of proteins per phage or prophage is called in (```PSA_phg_CDS_counts.csv```), so that I can arrive at a pairwise matrix of % genes shared between phages. 
+
+``` {r PSA_CDS_cnt}
+CDS_cnt<-read.table("/Users/duhaimem/busibee/PostDoc/TMPL/Helgoland_Phages/ecogenomics_project/genome_analysis/JGI/phage/seq_data/genes.aa/PSA_phg_CDS_counts.csv", header=FALSE)
+
+datatable(CDS_cnt, 
+          options = list(pageLength = 5),
+          caption = "CDS counts"
+          )
+
+allPSA_bs75_ed <- allPSA_bs75 %>% mutate( V13 = query ) %>% mutate( V14 = sbjt ) 
+allPSA_bs75_ed$V13<-gsub("_.*", "", allPSA_bs75_ed$V13)
+allPSA_bs75_ed$V14<-gsub("_.*", "", allPSA_bs75_ed$V14)
+#View(allPSA_bs75_ed)
+write.table(unique(allPSA_bs75_ed$V13),"/Users/duhaimem/busibee/PostDoc/TMPL/Helgoland_Phages/ecogenomics_project/genome_analysis/JGI/phage/seq_data/genes.aa/unique_orgs.tsv", col.name=FALSE, quote=FALSE, sep="\t")
+
+allPSA_bs75_pairfreq<-allPSA_bs75_ed %>% group_by(V13,V14) %>%
+      summarize(Count = n())
+
+colnames(allPSA_bs75_pairfreq) <- c("query","subject","count")
+colnames(CDS_cnt) <- c("query","CDS")
+
+all_PSA_bs75.m<-acast(allPSA_bs75_pairfreq, query~subject, value.var="count")
+all_PSA_bs75.pct.m<-sweep(all_PSA_bs75.m, 1, apply(all_PSA_bs75.m, 2, function(x) max(x, na.rm = TRUE)), FUN="/")
+
+#View(allPSA_bs75_pairfreq)
+
+datatable(allPSA_bs75_pairfreq, 
+          options = list(pageLength = 5),
+          caption = "% genes shared matrix"
+          )
+
+```
+
+I use the maximum distance method to encourage the self-hits and within-genus members to be attracted to the diagonal.
+```{r PSA_gnm_relatedness_heatmap_all, fig.width=12, fig.height=9}
+
+all_PSA_bs75.pct.m[is.na(all_PSA_bs75.pct.m)] <- 0
+
+PSA_gnm_palette<- c("#ffffe5",colorRampPalette(c("#fff7bc", "#fd8d3c", "#bd0026"))(n = 24))
+col_breaks = c(0,
+seq(0.01,0.2,length=5),    		# for yellow
+seq(0.21,0.4,length=5),              # for orange
+seq(0.41,1,length=15))              # for red
+
+prophg_v_iso = c("darkseagreen1",
+"darkseagreen1",
+"darkseagreen1",
+"darkseagreen1",
+"darkseagreen1",
+"palegreen3",
+"darkseagreen1",
+"darkseagreen1",
+"darkseagreen1",
+"darkseagreen1",
+"palegreen3",
+"palegreen3",
+"palegreen3",
+"palegreen3",
+"palegreen3",
+"palegreen3",
+"palegreen3",
+"palegreen3",
+"darkseagreen1",
+"darkseagreen1",
+"darkseagreen1",
+"darkseagreen1",
+"darkseagreen1",
+"darkseagreen1",
+"darkseagreen1",
+"palegreen3",
+"darkseagreen1",
+"darkseagreen1",
+"palegreen3",
+"darkseagreen1",
+"darkseagreen1",
+"darkseagreen1",
+"palegreen3",
+"darkseagreen1",
+"darkseagreen1",
+"darkseagreen1",
+"darkseagreen1",
+"darkseagreen1",
+"darkseagreen1",
+"darkseagreen1",
+"darkseagreen1",
+"darkseagreen1",
+"darkseagreen1",
+"palegreen3",
+"palegreen3",
+"palegreen3")
+
+
+heatmap.2(
+  all_PSA_bs75.pct.m, 
+  lmat=rbind(c(0,5,4,0,0), c(0,3,2,1,0)), 
+  lhei=c(2,5),
+  lwid=c(1,2,4,0.1,1),
+  col=PSA_gnm_palette, 
+  key='true',
+  trace="none",
+  margin=c(8, 8), 
+  main = "PSA Phage and Prophage\nblastp bit score >=75",
+  breaks=col_breaks, 
+  dendrogram=c("none"), 
+  distfun = function(x) dist(x,method = 'maximum'),
+  RowSideColors=prophg_v_iso
+)
+
+```
+
+Next, I generate a similar plot, but now only include the phage isoaltes from Helgoland and those that share a genus with them.
+```{r PSA_gnm_relatedness_heatmap_isolates}
+
+#colnames(all_PSA_bs75.pct.m)
+  
+helgo_phage = c("HM1",
+                "HS5",
+                "PH101", 
+                "TW1",
+                "ANT505",
+                "BSi20652",
+                "HP1",
+                "HS6",
+                "HS1",
+                "HS8",
+                "Pq0",
+                "HS2",
+                "PM2",
+                "HS4",
+                "RIO1",
+                "B8b",
+                "pYD6")
+
+all_PSA_bs75.pct.m.helgo = subset(all_PSA_bs75.pct.m, rownames(all_PSA_bs75.pct.m) == helgo_phage)
+
+all_PSA_bs75.pct.m.helgo = all_PSA_bs75.pct.m[helgo_phage, helgo_phage]
+
+heatmap.2(all_PSA_bs75.pct.m.helgo, key='true',trace="none",margin=c(7, 7), main = "Helgoland PSA Phage Isolates\nblastp bit score >=75",col=PSA_gnm_palette, breaks=col_breaks, dendrogram=c("none"), distfun = function(x) dist(x,method = 'maximum'))
+
+```
+
+# Figure 2. Quantitative host ranges and infection traits.
+I called in the matrix of the quantitative host range data, where burst size was input where a host-phage intersection resulted in infection. The host-phage intersections were 0 if there was no infection for that pair.
+```{r qHost_Range_heatmap}
+
+burst<-read.table("//Users/duhaimem/Box Sync/manuscripts_in_prep/PSA_comparative_genomics/2016Nov_PSA_phage_comparative_genomics/PSAphage_git_wd/PSA_phage_bursts.tsv", header=TRUE)
+burst.m<-data.matrix(burst)
+
+my_palette<- colorRampPalette(c("#f7fbff", "#4292c6", "#08306b"))(n = 39)
+col_breaks = c(seq(1,1,length=1),  # for yellow
+seq(1.1,82,length=19),              # for orange
+seq(82.1,165,length=20))              # for red
+heatmap.2(burst.m, key='true',trace="none",margin=c(6, 6), main = "PSA Phage-Host Range (burst)",col=my_palette, breaks=col_breaks, Colv=NA, Rowv=NA, dendrogram=c("none"))
+```
+
+```{r pheno_table, fig.keep = 'none'}
+pheno<-read.table("/Users/duhaimem/Box Sync/manuscripts_in_prep/PSA_comparative_genomics/2017Feb_PSA_phage_comparative_genomics/PSAphage_git_wd/PSA_phenotypes.tsv", header=TRUE)
+
+pheno$tot_inf <- (pheno$phg_tot_t0 - pheno$phg_t0)
+# to calculate the SD of the $tot_inf variable, we must use a method for standard propogation of error based on formula: newSD = sqrt(SD1^2 + SD2^2). Note this assumes a normal distribution. We do not have enough replicates to test for normality, so can no appropriate deal with SD in these data. 
+
+pheno$tot_prod <- (pheno$phage_eor - pheno$phg_t0)
+pheno$prod_eff <- (pheno$tot_prod/pheno$tot_inf)
+#total phage prod at end of rise per total infections that happened
+pheno$prod_rate <- (pheno$tot_prod/pheno$tot_inf/pheno$end_of_rise)
+
+```
+
+```{r prod_rate_pre, fig.keep = 'none'}
+plot(pheno$PHS, pheno$prod_rate, type="n")
+```
+
+```{r prod_rate}
+with (data = pheno, expr = errbar(PHS, prod_rate, prod_rate+0, prod_rate-0, add=T, pch=19, col=c("mediumpurple4","mediumpurple4","mediumpurple4","olivedrab","olivedrab","olivedrab","olivedrab","green4","green4","green4","darkorange1","firebrick3","firebrick3")))
+title("Phage produced per minute per infection")
+```
+
+
+#Figure 3: SDS-PAGE gel model
+The line widths are the per phage NSAF values, with a square root transformation and 1000 multiplier for effective visualization of relative values. The MW is modeled based on the amino acid sequence of the full protein.
+```{r SDSPAGE_model}
+plot(1, type="n", xlab="phage", ylab="MW (kDa)", xlim=c(0, 205), ylim=c(0, 130), main="SDS-PAGE gel model\nbased on mass-spec quantified peptide abundances")
+
+lines(c(81,90),c(33.929,33.929), lwd=78.4788099338169)
+lines(c(81,90),c(17.542,17.542), lwd=7.6912481243424)
+lines(c(81,90),c(56.665,56.665), lwd=2.3095776528268)
+lines(c(81,90),c(82.813,82.813), lwd=1.40999551860975)
+lines(c(81,90),c(81.266,81.266), lwd=3.85676840580957)
+lines(c(81,90),c(44.188,44.188), lwd=1.03426224952636)
+lines(c(81,90),c(33.626,33.626), lwd=1.94677965779935)
+lines(c(81,90),c(15.866,15.866), lwd=0.871735324600792)
+lines(c(81,90),c(39.723,39.723), lwd=0.765502345975606)
+lines(c(81,90),c(15.704,15.704), lwd=0.146334466959366)
+lines(c(81,90),c(44.721,44.721), lwd=0.511067610737483)
+lines(c(81,90),c(17.916,17.916), lwd=0.532164006296995)
+lines(c(81,90),c(92.076,92.076), lwd=0.445754702698598)
+lines(c(11,20),c(35.302,35.302), lwd=71.1526007967817)
+lines(c(11,20),c(175.561,175.561), lwd=2.62541556337356)
+lines(c(11,20),c(70.408,70.408), lwd=4.15646335477445)
+lines(c(11,20),c(80.579,80.579), lwd=6.29651566083371)
+lines(c(11,20),c(64.67,64.67), lwd=3.63408065450692)
+lines(c(11,20),c(64.046,64.046), lwd=3.19693459757733)
+lines(c(11,20),c(35.112,35.112), lwd=0.900233919594103)
+lines(c(11,20),c(30.28,30.28), lwd=0.693936746939262)
+lines(c(11,20),c(21.301,21.301), lwd=0.40005780552336)
+lines(c(11,20),c(18.107,18.107), lwd=6.41835164884163)
+lines(c(11,20),c(45.242,45.242), lwd=0.525409251254013)
+lines(c(191,200),c(15.573,15.573), lwd=8.30317776204151)
+lines(c(191,200),c(33.983,33.983), lwd=44.205603975695)
+lines(c(191,200),c(128.772,128.772), lwd=4.28533742732079)
+lines(c(191,200),c(27.254,27.254), lwd=11.7491553951082)
+lines(c(191,200),c(13.288,13.288), lwd=1.40363243120226)
+lines(c(191,200),c(6.79,6.79), lwd=3.94463446707894)
+lines(c(191,200),c(58.251,58.251), lwd=4.87625552398186)
+lines(c(191,200),c(41.431,41.431), lwd=16.1046690644128)
+lines(c(191,200),c(26.167,26.167), lwd=0.925471932660828)
+lines(c(191,200),c(55.38,55.38), lwd=1.41542766171656)
+lines(c(191,200),c(76.703,76.703), lwd=1.08449668728705)
+lines(c(191,200),c(14.011,14.011), lwd=1.31590540425211)
+lines(c(191,200),c(69.217,69.217), lwd=0.386232267242079)
+lines(c(156,165),c(78.37,78.37), lwd=5.0267551361308)
+lines(c(156,165),c(55.644,55.644), lwd=6.37861963952163)
+lines(c(156,165),c(34.303,34.303), lwd=43.5154891128467)
+lines(c(156,165),c(17.835,17.835), lwd=2.80442672640156)
+lines(c(156,165),c(5.361,5.361), lwd=0.501560933760279)
+lines(c(156,165),c(69.402,69.402), lwd=6.07952646982157)
+lines(c(156,165),c(41.883,41.883), lwd=19.1010058743312)
+lines(c(156,165),c(42.758,42.758), lwd=1.03120576932341)
+lines(c(156,165),c(15.524,15.524), lwd=2.17814020529699)
+lines(c(156,165),c(31.672,31.672), lwd=3.64456041832729)
+lines(c(156,165),c(93.126,93.126), lwd=2.50876221163026)
+lines(c(156,165),c(20.189,20.189), lwd=3.46824049940619)
+lines(c(156,165),c(15.617,15.617), lwd=0.417967444800233)
+lines(c(156,165),c(19.532,19.532), lwd=3.34373955840186)
+lines(c(46,55),c(39.922,39.922), lwd=35.1777398280165)
+lines(c(46,55),c(13.298,13.298), lwd=32.8601292650269)
+lines(c(46,55),c(20.509,20.509), lwd=4.19352147121064)
+lines(c(46,55),c(39.675,39.675), lwd=3.36288776779688)
+lines(c(46,55),c(96.573,96.573), lwd=2.23970018078654)
+lines(c(46,55),c(31.804,31.804), lwd=2.82238856490725)
+lines(c(46,55),c(13.24,13.24), lwd=0.233222584495137)
+lines(c(46,55),c(19.939,19.939), lwd=5.45714642933847)
+lines(c(46,55),c(49.333,49.333), lwd=2.81162782419138)
+lines(c(46,55),c(29.016,29.016), lwd=1.33945403257342)
+lines(c(46,55),c(22.149,22.149), lwd=0.338457165303919)
+lines(c(46,55),c(53.094,53.094), lwd=0.508719731149271)
+lines(c(46,55),c(42.26,42.26), lwd=0.335727672035339)
+lines(c(46,55),c(19.438,19.438), lwd=0.225028277472335)
+lines(c(46,55),c(19.134,19.134), lwd=4.91633208115749)
+lines(c(46,55),c(35.761,35.761), lwd=0.420507387195778)
+lines(c(46,55),c(26.323,26.323), lwd=0.115639531478839)
+lines(c(46,55),c(48.09,48.09), lwd=2.25348830574148)
+lines(c(46,55),c(32.556,32.556), lwd=0.331526301850596)
+lines(c(46,55),c(53.586,53.586), lwd=0.0567555982718228)
+lines(c(121,130),c(33.929,33.929), lwd=71.5524469993254)
+lines(c(121,130),c(82.813,82.813), lwd=2.37300918028319)
+lines(c(121,130),c(17.542,17.542), lwd=6.24786328008358)
+lines(c(121,130),c(44.188,44.188), lwd=2.18995784289797)
+lines(c(121,130),c(56.665,56.665), lwd=2.90800441038482)
+lines(c(121,130),c(15.866,15.866), lwd=3.23018781827451)
+lines(c(121,130),c(33.626,33.626), lwd=3.48249071717164)
+lines(c(121,130),c(42.551,42.551), lwd=0.759406036202235)
+lines(c(121,130),c(44.721,44.721), lwd=0.717629666054109)
+lines(c(121,130),c(14.197,14.197), lwd=0.122058379098092)
+lines(c(121,130),c(77.805,77.805), lwd=3.27443486552053)
+lines(c(121,130),c(21.903,21.903), lwd=2.45665722397936)
+lines(c(121,130),c(92.076,92.076), lwd=0.457542943562629)
+lines(c(121,130),c(15.704,15.704), lwd=0.228310637161899)
+
+text(15.5,1,"HP1")
+text(50.5,1,"HM1")
+text(85.5,1,"HS1")
+text(125.5,1,"HS5")
+text(160.5,1,"HS2")
+text(195.5,1,"HS6")
+```
+
+# Supplementary Figures and Tables. 
+
+## Extended infection phenotype data and phage one-step virus accumulation curves
+
+```{r burst_per_phg_pre, fig.keep = 'none'}
+
+plot(pheno$PHS, pheno$burst, type="n", main="Burst Size")
+```
+
+```{r burst_per_phg}
+with (data = pheno, expr = errbar(PHS, burst, burst+burst_sd, burst-burst_sd, add=T, pch=19, col=c("mediumpurple4","mediumpurple4","mediumpurple4","olivedrab","olivedrab","olivedrab","olivedrab","green4","green4","green4","darkorange1","firebrick3","firebrick3")))
+title("Burst Size")
+```
+
+```{r latent_per_phg_pre, fig.keep = 'none'}
+plot(pheno$PHS, pheno$latent, type="n")
+```
+
+```{r latent_per_phg}
+with (data = pheno, expr = errbar(PHS, latent, latent+0, latent-0, add=T, pch=19, col=c("mediumpurple4","mediumpurple4","mediumpurple4","olivedrab","olivedrab","olivedrab","olivedrab","green4","green4","green4","darkorange1","firebrick3","firebrick3")))
+title("Latent Period")
+```
+
+## One-steps
+```{r one_steps_growth_per_phg}
+
+one_steps<-read.table("/Users/duhaimem/Box Sync/manuscripts_in_prep/PSA_phage_ecogenomics_manuscript/PSAphage_git_wd/PSA_phage_one_steps.tsv",header=TRUE)
+
+PHS_palette <- c("darkorange1", "firebrick3", "firebrick1", "darkgreen", "olivedrab4", "olivedrab", "green4", "green3", "mediumpurple1", "mediumpurple4", "mediumpurple", "olivedrab3", "olivedrab4")
+
+colScale <- scale_colour_manual(name = "PHS",values = PHS_palette)
+
+ggplot(data=one_steps, aes(x=time, y=phgml, group=PHS, colour=PHS)) +
+  geom_line() +
+  geom_point(shape = "-") + 
+  scale_y_log10() +
+  colScale +
+  geom_errorbar(aes(ymin=phgml-SD, ymax=phgml+SD), width=.1) +
+  ylab("free phage (PFU/ml)")  +
+  xlab("time (mins)") +
+  ggtitle("One-step Curves (phage_host)") + 
+  theme(plot.title = element_text(lineheight=.8, face="bold"))
+  
+```
+
+
+#Supplementary Figures 3 and 4: raxml calls 
+```
+#raxml call: raxmlHPC-PTHREADS-SSE3 -m PROTGAMMAGTR -p 333 -f a -s LabriePSA_phage_dna_pol_shortname_ncbi_ROI_CW03_ed_PH101.phylip -T 10 -x 777 -N 100 -n bs100_pol_final 
+
+#raxml call: raxmlHPC-PTHREADS-SSE3 -m PROTGAMMAGTR -p 333 -f a -s 2014_all_terL_PSA_relatives_VpV262s_SIOfusion_noXccP1_PH101.phylip -T 10 -x 777 -N 100 -n bs100_terL_final 
+
+#raxml call: raxmlHPC-PTHREADS-SSE3 -m GTRGAMMA -p 333 -f a -s 16S_ncbi_PSAemirge_noVib.SINA.aln.phy -T 3 -x 777 -N 100 -n bs100 
+```
+# PSA proteins in the POV and TOV Datasets
+Having identified the PSA proteins with homology to known sequences and conserved protein familes in public databases (e.g., GenBank, Pfam), we sought to expand this search to proteins and protein clusters from two major environmental virome datasets: Pacific Ocean Viruses (POV; [Hurwitz et al. 2013](http://journals.plos.org/plosone/article?id=10.1371/journal.pone.0057355) and the Tara Ocean Viruses (TOV; [Brum et al.](http://science.sciencemag.org/content/348/6237/1261498), collectively referred to as 'TOV', hereafter.
+
+First, we explore the TOV proteins whose best BLAST hit is to a PSA phage protein. "Hits" are based on a significance threshold of blastp bit score >50 and e-value <0.001.
+
+```{r POVTOV_blast_PSAbest_import}
+PTOV_PSAbest<-read.table("/Users/duhaimem/Box Sync/manuscripts_in_prep/PSA_comparative_genomics/2016Nov_PSA_phage_comparative_genomics/PSAphage_git_wd/TOV_43-vs-PSA_PSA-hits-best.csv", header=FALSE)
+colnames(PTOV_PSAbest) <- c("query","sbjt","%id","algnmt_ln","mismtch","gaps","q.start","q.end","s.start","s.end","eval","bit")
+
+PTOV_PSAbest_protsumm <- aggregate(as.character(query) ~ sbjt, PTOV_PSAbest, list)
+PTOV_PSAbest_protsumm["PTOV_hit_cnt"] <- lengths(PTOV_PSAbest_protsumm$`as.character(query)`)
+PTOV_PSAbest_protsumm <- PTOV_PSAbest_protsumm[c(1,3,2)]
+names(PTOV_PSAbest_protsumm)[3] <- "PTOV_hit_cnt"
+
+datatable(PTOV_PSAbest_protsumm, 
+          options = list(pageLength = 10),
+          caption = "PSA phage proteins (sbjt) and the list of best hits to proteins in POV and TOV datasets (query)"
+          )
+
+write.table(PTOV_PSAbest_protsumm[,1:2],"/Users/duhaimem/Box Sync/manuscripts_in_prep/PSA_comparative_genomics/2016Nov_PSA_phage_comparative_genomics/PSAphage_git_wd/PTOV_PSAbest_protsumm.tsv", row.names = FALSE, col.name=TRUE, quote=FALSE, sep="\t")
+```
+`r nrow(PTOV_PSAbest)` TOV proteins had a better hit to PSA viruses than existing RefSeq proteins.
+
+Proteins from these datasets that did not share significant homology to existing proteins in NCBI's RefSeq were considered unaffiliated. Some people refer to this as the "unknown" or "dark matter" of the virus protein universe. We sought to deterine how many of these unaffiliated proteins (e.g., do not form protein clusters with existing proteins in RefSeq) formed homology-based protein clusters with PSA phage proteins. "Affiliation" was assigned based on a significance threshold of blastp bit score >50 and e-value <0.001.
+
+Now to explore the contribution of PSA phages to annotating the unknown virus protein universe...
+```{r POVTOV_blast_PSAonly_import}
+PTOV_PSAonly<-read.table("/Users/duhaimem/Box Sync/manuscripts_in_prep/PSA_comparative_genomics/2016Nov_PSA_phage_comparative_genomics/PSAphage_git_wd/TOV_43-vs-PSA_PSA-hits-only.csv", header=FALSE)
+
+colnames(PTOV_PSAonly) <- c("query","sbjt","%id","algnmt_ln","mismtch","gaps","q.start","q.end","s.start","s.end","eval","bit")
+
+PTOV_PSAonly_protsumm <- aggregate(as.character(query) ~ sbjt, PTOV_PSAonly, list)
+PTOV_PSAonly_protsumm["PTOV_hit_cnt"] <- lengths(PTOV_PSAonly_protsumm$`as.character(query)`)
+PTOV_PSAonly_protsumm <- PTOV_PSAonly_protsumm[c(1,3,2)]
+names(PTOV_PSAonly_protsumm)[3] <- "PTOV_hit_cnt"
+
+datatable(PTOV_PSAonly_protsumm, 
+          options = list(pageLength = 10),
+          caption = "PSA phage proteins (sbjt) and the list of best hits to proteins in POV and TOV datasets (query)"
+          )
+
+write.table(PTOV_PSAonly_protsumm[,1:2],"/Users/duhaimem/Box Sync/manuscripts_in_prep/PSA_comparative_genomics/2016Nov_PSA_phage_comparative_genomics/PSAphage_git_wd/PTOV_PSAonly_protsumm.tsv", row.names = FALSE, col.name=TRUE, quote=FALSE, sep="\t")
+
+
+```
+`r nrow(PTOV_PSAonly)` TOV proteins had hits exclusively to PSA proteins, with no significant homology to existing RefSeq proteins. In other words, the PSA phages helped to annotate `r nrow(PTOV_PSAonly)` otherwise unknown ocean virus metagenome proteins as bonafide phage proteins.
+
+
+
